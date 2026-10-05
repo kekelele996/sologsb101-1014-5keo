@@ -87,7 +87,16 @@ export default function ReplantPlan() {
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplantFormValues>();
 
+  // 推进到「已补植 / 部分补植」时登记实际补植株数的弹窗
+  const [advanceRow, setAdvanceRow] = useState<Replant | null>(null);
+  const [advanceActual, setAdvanceActual] = useState<number>(0);
+
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
+
+  /** 实际补植株数（兼容旧数据 undefined → 0） */
+  const actualOf = (row: Replant): number => (typeof row.actualCount === 'number' ? row.actualCount : 0);
+  /** 差额（株）= 计划数 - 实际数，不低于 0 */
+  const remainingOf = (row: Replant): number => Math.max(0, row.missingCount - actualOf(row));
 
   const filtered = useMemo(() => {
     const key = filters.keyword.trim().toLowerCase();
@@ -103,15 +112,22 @@ export default function ReplantPlan() {
   }, [rows, filters, plots]);
 
   const stats = useMemo(() => {
-    const missing = rows.reduce((acc, row) => acc + row.missingCount, 0);
+    const planned = rows.reduce((acc, row) => acc + row.missingCount, 0);
+    const actual = rows.reduce((acc, row) => acc + actualOf(row), 0);
+    const difference = rows.reduce((acc, row) => acc + remainingOf(row), 0);
     const reviewed = rows.filter((row) => row.state === '已复核').length;
-    const pending = rows.filter((row) => row.state === '待补植').length;
+    const partial = rows.filter((row) => row.state === '部分补植').length;
+    const pending = rows.filter((row) => row.state === '待补植' || row.state === '部分补植').length;
     return {
-      missing,
+      planned,
+      actual,
+      difference,
       pending,
+      partial,
       reviewed,
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows]);
 
   const openCreate = (): void => {
@@ -167,12 +183,34 @@ export default function ReplantPlan() {
   };
 
   const handleAdvance = async (row: Replant): Promise<void> => {
-    const next = await advance(row.id);
-    if (next === null) {
+    if (row.state === '已复核') {
       message.info('该计划已处于最终状态（已复核）');
       return;
     }
-    message.success(`状态已推进为「${next}」`);
+    if (row.state === '已补植') {
+      // 已补植 → 已复核：复核动作，直接推进
+      const next = await advance(row.id);
+      if (next === null) {
+        message.info('该计划已处于最终状态（已复核）');
+        return;
+      }
+      message.success(`状态已推进为「${next}」`);
+      return;
+    }
+    // 待补植 / 部分补植 → 登记本次实际补植株数（默认填计划数 / 差额）
+    setAdvanceRow(row);
+    setAdvanceActual(remainingOf(row));
+  };
+
+  const handleAdvanceConfirm = async (): Promise<void> => {
+    if (advanceRow === null) return;
+    const next = await advance(advanceRow.id, advanceActual);
+    if (next === null) {
+      message.info('该计划已处于最终状态（已复核）');
+    } else {
+      message.success(`状态已推进为「${next}」`);
+    }
+    setAdvanceRow(null);
   };
 
   const handleExport = async (): Promise<void> => {
@@ -230,9 +268,9 @@ export default function ReplantPlan() {
       ),
     },
     {
-      title: '缺株数（株）',
+      title: '计划数（株）',
       key: 'missingCount',
-      width: 190,
+      width: 130,
       render: (_value, record) => {
         const draft = drafts[record.id];
         if (draft === undefined) return record.missingCount.toLocaleString('zh-CN');
@@ -242,10 +280,32 @@ export default function ReplantPlan() {
             max={200000}
             step={10}
             size="small"
-            style={{ width: 130 }}
+            style={{ width: 110 }}
             value={draft.missingCount ?? record.missingCount}
             onChange={(value) => setDraft(record.id, { missingCount: value ?? 0 })}
           />
+        );
+      },
+    },
+    {
+      title: '实际数（株）',
+      key: 'actualCount',
+      width: 110,
+      align: 'right',
+      render: (_value, record) =>
+        actualOf(record) > 0 ? actualOf(record).toLocaleString('zh-CN') : '—',
+    },
+    {
+      title: '差额（株）',
+      key: 'difference',
+      width: 110,
+      align: 'right',
+      render: (_value, record) => {
+        const diff = remainingOf(record);
+        return (
+          <Typography.Text type={diff > 0 ? 'warning' : 'secondary'}>
+            {diff > 0 ? diff.toLocaleString('zh-CN') : '0'}
+          </Typography.Text>
         );
       },
     },
@@ -290,9 +350,11 @@ export default function ReplantPlan() {
       dataIndex: 'state',
       key: 'state',
       width: 110,
-      render: (value: ReplantState) => (
-        <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
-      ),
+      render: (value: ReplantState) => {
+        const color =
+          value === '待补植' ? 'orange' : value === '部分补植' ? 'gold' : value === '已补植' ? 'blue' : 'green';
+        return <Tag color={color}>{value}</Tag>;
+      },
     },
     {
       title: '草稿',
@@ -371,8 +433,27 @@ export default function ReplantPlan() {
     <div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="补植计划" value={rows.length} suffix="条" tone="primary" />
-        <StatBadge label="待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
-        <StatBadge label="缺株合计" value={stats.missing.toLocaleString('zh-CN')} suffix="株" tone="danger" />
+        <StatBadge
+          label="待办补植"
+          value={stats.pending}
+          suffix="条"
+          tone={stats.pending > 0 ? 'warning' : 'default'}
+          hint="待补植 + 部分补植，仍需补植作业"
+        />
+        <StatBadge
+          label="部分补植"
+          value={stats.partial}
+          suffix="条"
+          tone={stats.partial > 0 ? 'warning' : 'default'}
+          hint="少补的计划，已留在待办"
+        />
+        <StatBadge
+          label="差额合计"
+          value={stats.difference.toLocaleString('zh-CN')}
+          suffix="株"
+          tone="danger"
+          hint="Σ（计划数 - 实际数），不低于 0"
+        />
         <StatBadge
           label="复核完成率"
           value={percentText(stats.reviewPct)}
@@ -467,7 +548,7 @@ export default function ReplantPlan() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1400 }}
+            scroll={{ x: 1500 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -515,9 +596,48 @@ export default function ReplantPlan() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率。
+            推进到「已补植 / 部分补植」时需登记实际补植株数：按实际数回写地块缺株数（计划 - 实际，减到零为止）并重算最新测次成活率；少补会标记为「部分补植」并留在待办。
           </Typography.Text>
         </Form>
+      </Modal>
+
+      <Modal
+        title="登记实际补植株数"
+        open={advanceRow !== null}
+        onCancel={() => setAdvanceRow(null)}
+        onOk={() => void handleAdvanceConfirm()}
+        okText="确认补植"
+        cancelText="取消"
+        okButtonProps={{ disabled: advanceRow === null }}
+      >
+        {advanceRow !== null ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <div>
+              <Typography.Text type="secondary">地块：</Typography.Text>
+              {plotName(advanceRow.plotId)}
+            </div>
+            <div>
+              <Typography.Text type="secondary">
+                计划补植 {advanceRow.missingCount.toLocaleString('zh-CN')} 株 · 已补 {actualOf(advanceRow).toLocaleString('zh-CN')} 株 · 差额{' '}
+                {remainingOf(advanceRow).toLocaleString('zh-CN')} 株
+              </Typography.Text>
+            </div>
+            <div>
+              <Typography.Text type="secondary">本次实际补植株数：</Typography.Text>
+              <InputNumber
+                min={0}
+                max={500000}
+                step={10}
+                style={{ width: '100%' }}
+                value={advanceActual}
+                onChange={(value) => setAdvanceActual(value ?? 0)}
+              />
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              默认填计划数（差额）；少补会标记为「部分补植」并留在待办，多补如实记录。
+            </Typography.Text>
+          </Space>
+        ) : null}
       </Modal>
     </div>
   );

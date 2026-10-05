@@ -9,6 +9,7 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { Replant } from '../types/replant';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -19,6 +20,7 @@ import {
   removePlot,
 } from '../utils/db';
 import { buildSurvivalSummary, type SurvivalSummary } from '../hooks/useSurvivalRate';
+import { replantDifference } from '../utils/rate';
 import { nowIso, uuid } from '../utils/id';
 
 /** 地块筛选条件（关键字 + 潮位带 + 底质），由 <FilterBar> 同步到 URL query */
@@ -49,6 +51,18 @@ export interface PlotStat {
   suggestReplant: number;
 }
 
+/** 单个地块的补植计划汇总，供地块台账展示「计划数 / 实际数 / 差额」 */
+export interface ReplantStats {
+  /** 计划补植株数合计（Σ 计划缺株数） */
+  planned: number;
+  /** 实际补植株数合计（Σ 实际补植株数） */
+  actual: number;
+  /** 差额（株）= 计划 - 实际，不低于 0 */
+  difference: number;
+  /** 待办补植条数（待补植 + 部分补植） */
+  todoCount: number;
+}
+
 const EMPTY_FILTERS: PlotFilters = { keyword: '', tideZone: 'all', substrate: 'all' };
 const CURRENT_PLOT_KEY = 'gbmangrove:currentPlotId';
 
@@ -74,6 +88,7 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  replants: Replant[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -92,6 +107,7 @@ interface PlotStoreState {
   resetFilters: () => void;
   visiblePlots: () => Plot[];
   statOf: (plotId: string) => PlotStat;
+  replantStatsOf: (plotId: string) => ReplantStats;
   summaryOf: (plotId: string | null) => SurvivalSummary;
   refreshCounts: () => Promise<void>;
 }
@@ -114,6 +130,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  replants: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,15 +147,16 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.replants.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, replants };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, replants }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
@@ -165,6 +183,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              replants,
               stats,
               summaries,
               loading: false,
@@ -261,6 +280,18 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
 
   statOf(plotId) {
     return get().stats[plotId] ?? { plotId, ...EMPTY_STAT };
+  },
+
+  replantStatsOf(plotId) {
+    const rows = get().replants.filter((row) => row.plotId === plotId);
+    const planned = rows.reduce((acc, row) => acc + row.missingCount, 0);
+    const actual = rows.reduce((acc, row) => acc + (typeof row.actualCount === 'number' ? row.actualCount : 0), 0);
+    return {
+      planned,
+      actual,
+      difference: replantDifference(planned, actual),
+      todoCount: rows.filter((row) => row.state === '待补植' || row.state === '部分补植').length,
+    };
   },
 
   summaryOf(plotId) {

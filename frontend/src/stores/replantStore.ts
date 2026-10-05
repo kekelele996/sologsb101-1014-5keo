@@ -11,6 +11,7 @@ import {
   exportSnapshot,
   importSnapshot,
   initDatabase,
+  normalizeReplant,
   putReplant,
   removeReplant,
   resetDatabase,
@@ -44,8 +45,12 @@ export interface ReplantStoreState {
   saveDraft: (replantId: string) => Promise<void>;
   createReplant: (draft: ReplantDraft) => Promise<Replant>;
   deleteReplant: (replantId: string) => Promise<void>;
-  /** 推进到下一状态；进入「已补植」时回写地块缺株数并重算成活率 */
-  advance: (replantId: string) => Promise<ReplantState | null>;
+  /**
+   * 推进到下一状态。
+   * 「待补植 / 部分补植 → 已补植 / 部分补植」需登记本次实际补植株数（默认填计划数 / 差额），
+   * 回写地块缺株数并重算成活率；「已补植 → 已复核」无需登记实际数。
+   */
+  advance: (replantId: string, actualCount?: number) => Promise<ReplantState | null>;
   setState: (replantId: string, state: ReplantState) => Promise<void>;
   batchAdvance: () => Promise<number>;
   setSelectedIds: (ids: string[]) => void;
@@ -56,7 +61,6 @@ export interface ReplantStoreState {
 }
 
 const EMPTY_FILTERS: ReplantFilters = { plotId: 'all', state: 'all', keyword: '' };
-const FLOW: ReplantState[] = ['待补植', '已补植', '已复核'];
 
 export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   filters: { ...EMPTY_FILTERS },
@@ -109,6 +113,7 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       id: uuid('replant'),
       plotId: draft.plotId,
       missingCount: draft.missingCount,
+      actualCount: 0,
       planDate: draft.planDate,
       species: draft.species,
       state: draft.state,
@@ -130,23 +135,50 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     });
   },
 
-  async advance(replantId) {
+  async advance(replantId, actualCount) {
     const existing = await db.replants.get(replantId);
     if (!existing) return null;
-    const index = FLOW.indexOf(existing.state);
-    if (index < 0 || index >= FLOW.length - 1) return null;
-    const next = FLOW[index + 1];
-    await advanceReplantState(replantId, next);
+    const normalized = normalizeReplant(existing);
+
+    // 已复核为终态，不可继续推进
+    if (normalized.state === '已复核') return null;
+
+    // 已补植 → 已复核：复核动作，无需登记实际补植株数
+    if (normalized.state === '已补植') {
+      await advanceReplantState(replantId, '已复核');
+      await usePlotStore.getState().refreshCounts();
+      set({ revision: get().revision + 1, lastMessage: '状态已推进为「已复核」' });
+      return '已复核';
+    }
+
+    // 待补植 / 部分补植 → 需登记本次实际补植株数（默认填计划数 / 差额）
+    const remaining = Math.max(0, normalized.missingCount - normalized.actualCount);
+    const thisActual = Math.max(0, Math.round(actualCount ?? remaining));
+    const newActual = normalized.actualCount + thisActual;
+    const next: ReplantState = newActual >= normalized.missingCount ? '已补植' : '部分补植';
+
+    await advanceReplantState(replantId, next, thisActual);
     await usePlotStore.getState().refreshCounts();
     set({
       revision: get().revision + 1,
-      lastMessage: next === '已补植' ? '已标记补植完成，地块缺株数与成活率已回写' : `状态已推进为「${next}」`,
+      lastMessage:
+        next === '已补植'
+          ? `已按实际 ${thisActual} 株补植完成，地块缺株数与成活率已回写`
+          : `本次补植 ${thisActual} 株，仍差 ${normalized.missingCount - newActual} 株，已标记为部分补植并留在待办`,
     });
     return next;
   },
 
   async setState(replantId, state) {
-    await advanceReplantState(replantId, state);
+    const existing = await db.replants.get(replantId);
+    if (existing !== undefined && (state === '已补植' || state === '部分补植')) {
+      // 直接改状态时，按「差额」作为本次实际补植株数回写
+      const normalized = normalizeReplant(existing);
+      const remaining = Math.max(0, normalized.missingCount - normalized.actualCount);
+      await advanceReplantState(replantId, state, remaining);
+    } else {
+      await advanceReplantState(replantId, state);
+    }
     set({ revision: get().revision + 1 });
   },
 

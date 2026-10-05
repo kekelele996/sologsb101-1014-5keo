@@ -65,6 +65,7 @@ export default function PlotList() {
   const resetFilters = usePlotStore((state) => state.resetFilters);
   const visiblePlots = usePlotStore((state) => state.visiblePlots);
   const statOf = usePlotStore((state) => state.statOf);
+  const replantStatsOf = usePlotStore((state) => state.replantStatsOf);
   const createPlot = usePlotStore((state) => state.createPlot);
   const updatePlot = usePlotStore((state) => state.updatePlot);
   const deletePlot = usePlotStore((state) => state.deletePlot);
@@ -226,13 +227,29 @@ export default function PlotList() {
       },
     },
     {
-      title: '缺株数',
-      dataIndex: 'missingCount',
-      key: 'missingCount',
+      title: '计划补植',
+      key: 'planned',
       width: 96,
       align: 'right',
-      render: (value: number) => (
-        <Typography.Text type={value > 0 ? 'warning' : 'secondary'}>{value} 株</Typography.Text>
+      render: (_value, record) => `${replantStatsOf(record.id).planned.toLocaleString('zh-CN')} 株`,
+    },
+    {
+      title: '实际补植',
+      key: 'actual',
+      width: 96,
+      align: 'right',
+      render: (_value, record) => `${replantStatsOf(record.id).actual.toLocaleString('zh-CN')} 株`,
+    },
+    {
+      title: '差额',
+      key: 'difference',
+      width: 96,
+      align: 'right',
+      sorter: (a, b) => a.missingCount - b.missingCount,
+      render: (_value, record) => (
+        <Typography.Text type={record.missingCount > 0 ? 'warning' : 'secondary'}>
+          {record.missingCount.toLocaleString('zh-CN')} 株
+        </Typography.Text>
       ),
     },
     {
@@ -348,7 +365,7 @@ export default function PlotList() {
             loading={!ready}
             columns={columns}
             dataSource={rows}
-            scroll={{ x: 1480 }}
+            scroll={{ x: 1680 }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{
               emptyText: (

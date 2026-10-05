@@ -145,10 +145,13 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
     const stamp = nowIso();
+    // 同步地块缺株数为本次验收评估的缺株数，保证「计划数 - 实际数 = 差额」口径一致
+    await db.plots.update(plotId, { missingCount: missing, updatedAt: stamp });
     await db.replants.put({
       id: uuid('replant'),
       plotId,
       missingCount: missing,
+      actualCount: 0,
       planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
       species,
       state: '待补植',

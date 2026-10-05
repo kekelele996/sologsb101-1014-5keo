@@ -101,6 +101,8 @@ export function exportSummaryCsv(
     '判定等级',
     '平均株高(cm)',
     '缺株数(株)',
+    '计划补植数(株)',
+    '实际补植数(株)',
     '补植计划数',
     '最近补植日期',
   ];
@@ -113,6 +115,11 @@ export function exportSummaryCsv(
     const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
+    const planned = plotReplants.reduce((acc, row) => acc + row.missingCount, 0);
+    const actual = plotReplants.reduce(
+      (acc, row) => acc + (typeof row.actualCount === 'number' ? row.actualCount : 0),
+      0,
+    );
     lines.push(
       [
         plot.name,
@@ -131,6 +138,8 @@ export function exportSummaryCsv(
         latest ? RATE_LEVEL_LABEL[latest.grade] : '—',
         latest ? latest.avgHeightCm : 0,
         plot.missingCount,
+        planned,
+        actual,
         plotReplants.length,
         plot.lastReplantDate || '—',
       ]
@@ -180,11 +189,18 @@ export function buildSummaryText(
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
-    const pending = replants.filter((row) => row.plotId === plot.id && row.state !== '已复核').length;
+    const plotReplants = replants.filter((row) => row.plotId === plot.id);
+    const planned = plotReplants.reduce((acc, row) => acc + row.missingCount, 0);
+    const actual = plotReplants.reduce(
+      (acc, row) => acc + (typeof row.actualCount === 'number' ? row.actualCount : 0),
+      0,
+    );
+    // 待办补植：待补植 + 部分补植（仍需补植作业）
+    const pending = plotReplants.filter((row) => row.state === '待补植' || row.state === '部分补植').length;
     lines.push(
       `· ${plot.name}（${plot.tideZone}潮位带 / ${plot.substrate}）栽植 ${total} 株，最新成活率 ${
         latest ? percentText(rate) : '未验收'
-      }，缺株 ${plot.missingCount} 株，待办补植 ${pending} 条`,
+      }，缺株 ${plot.missingCount} 株（计划 ${planned} / 实际 ${actual}），待办补植 ${pending} 条`,
     );
   });
   return lines.join('\n');

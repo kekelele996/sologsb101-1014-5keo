@@ -146,6 +146,11 @@ export function suggestReplantCount(totalCount: number, aliveCount: number): num
   return Math.max(0, Math.round(totalCount - aliveCount));
 }
 
+/** 补植差额（株）= 计划数 - 实际数，不低于 0；用于「计划数 / 实际数 / 差额」台账口径 */
+export function replantDifference(planned: number, actual: number): number {
+  return Math.max(0, Math.round(planned) - Math.round(actual));
+}
+
 /** 百分比文案 */
 export function percentText(value: number): string {
   return `${round1(value)}%`;
