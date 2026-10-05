@@ -9,6 +9,7 @@ import type { Survey } from '../types/survey';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import type { Replant } from '../types/replant';
+import { isReplantPending, replantGap } from '../types/replant';
 import { RATE_LEVEL_LABEL } from '../types/survey';
 import { calcSurvivalRate, percentText, round1 } from './rate';
 import { stampSuffix } from './id';
@@ -102,6 +103,9 @@ export function exportSummaryCsv(
     '平均株高(cm)',
     '缺株数(株)',
     '补植计划数',
+    '计划补植株数(株)',
+    '实际补植株数(株)',
+    '补植差额(计划-实际,株)',
     '最近补植日期',
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
@@ -113,6 +117,9 @@ export function exportSummaryCsv(
     const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
+    const planCount = plotReplants.reduce((acc, row) => acc + row.missingCount, 0);
+    const actualCount = plotReplants.reduce((acc, row) => acc + (row.actualCount ?? 0), 0);
+    const gap = plotReplants.reduce((acc, row) => acc + (replantGap(row) ?? row.missingCount), 0);
     lines.push(
       [
         plot.name,
@@ -132,6 +139,9 @@ export function exportSummaryCsv(
         latest ? latest.avgHeightCm : 0,
         plot.missingCount,
         plotReplants.length,
+        planCount,
+        actualCount,
+        gap,
         plot.lastReplantDate || '—',
       ]
         .map(csvCell)
@@ -180,11 +190,13 @@ export function buildSummaryText(
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
-    const pending = replants.filter((row) => row.plotId === plot.id && row.state !== '已复核').length;
+    const plotReplants = replants.filter((row) => row.plotId === plot.id);
+    const pending = plotReplants.filter((row) => isReplantPending(row.state)).length;
+    const actual = plotReplants.reduce((acc, row) => acc + (row.actualCount ?? 0), 0);
     lines.push(
       `· ${plot.name}（${plot.tideZone}潮位带 / ${plot.substrate}）栽植 ${total} 株，最新成活率 ${
         latest ? percentText(rate) : '未验收'
-      }，缺株 ${plot.missingCount} 株，待办补植 ${pending} 条`,
+      }，缺株 ${plot.missingCount} 株，已实际补植 ${actual} 株，待办补植 ${pending} 条`,
     );
   });
   return lines.join('\n');

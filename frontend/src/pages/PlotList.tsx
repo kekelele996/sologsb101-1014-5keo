@@ -34,7 +34,11 @@ import FilterBar from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
 import RateTag from '../components/common/RateTag';
 import StatBadge from '../components/common/StatBadge';
+import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
+import { db } from '../utils/db';
+import type { Replant } from '../types/replant';
+import { isReplantPending, replantGap } from '../types/replant';
 import {
   PLOT_STATE_OPTIONS,
   RESTORE_MODE_OPTIONS,
@@ -74,6 +78,23 @@ export default function PlotList() {
   const [editing, setEditing] = useState<Plot | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<PlotDraft>();
+
+  const { rows: replantRows } = useIdbTable<Replant>(db.replants, { sortByUpdatedAt: false });
+
+  /** 按地块汇总补植计划数 / 实际数 / 差额（计划−实际） */
+  const replantOf = useMemo(() => {
+    const map: Record<string, { plan: number; actual: number; gap: number; pending: number }> = {};
+    replantRows.forEach((row) => {
+      const item = (map[row.plotId] ??= { plan: 0, actual: 0, gap: 0, pending: 0 });
+      item.plan += row.missingCount;
+      item.actual += row.actualCount ?? 0;
+      item.gap += replantGap(row) ?? row.missingCount;
+      if (isReplantPending(row.state)) item.pending += 1;
+    });
+    return map;
+  }, [replantRows]);
+
+  const EMPTY_REPLANT = { plan: 0, actual: 0, gap: 0, pending: 0 };
 
   const rows = useMemo(() => visiblePlots(), [visiblePlots, plots, filters]);
 
@@ -236,6 +257,38 @@ export default function PlotList() {
       ),
     },
     {
+      title: '补植计划 / 实际（差额）',
+      key: 'replant',
+      width: 210,
+      render: (_value, record) => {
+        const item = replantOf[record.id] ?? EMPTY_REPLANT;
+        if (item.plan === 0) {
+          return <Typography.Text type="secondary">无补植计划</Typography.Text>;
+        }
+        const gapText =
+          item.gap > 0
+            ? `少补 ${item.gap.toLocaleString('zh-CN')} 株`
+            : item.gap < 0
+              ? `多补 ${Math.abs(item.gap).toLocaleString('zh-CN')} 株`
+              : '已补齐';
+        return (
+          <Space direction="vertical" size={0}>
+            <span>
+              计划 <Typography.Text strong>{item.plan.toLocaleString('zh-CN')}</Typography.Text> / 实际{' '}
+              <Typography.Text strong style={{ color: '#2563a8' }}>
+                {item.actual.toLocaleString('zh-CN')}
+              </Typography.Text>{' '}
+              株
+            </span>
+            <Typography.Text type={item.gap > 0 ? 'warning' : item.gap < 0 ? undefined : 'success'} style={{ fontSize: 12 }}>
+              {gapText}
+              {item.pending > 0 ? ` · ${item.pending} 条待办` : ''}
+            </Typography.Text>
+          </Space>
+        );
+      },
+    },
+    {
       title: '操作',
       key: 'action',
       width: 260,
@@ -348,7 +401,7 @@ export default function PlotList() {
             loading={!ready}
             columns={columns}
             dataSource={rows}
-            scroll={{ x: 1480 }}
+            scroll={{ x: 1700 }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{
               emptyText: (

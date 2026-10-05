@@ -78,7 +78,7 @@ export async function seedDatabase(): Promise<void> {
       substrate: '砂泥质',
       restoreMode: '补植',
       state: '跟踪中',
-      missingCount: 0,
+      missingCount: 388,
       lastReplantDate: '2025-04-20',
     }),
     plotRow({
@@ -127,16 +127,43 @@ export async function seedDatabase(): Promise<void> {
     surveyRow({ id: 'survey-a2', plotId: SEED_IDS.plotA, round: 2, date: '2024-09-18', aliveCount: 4420, avgHeightCm: 78 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-a3', plotId: SEED_IDS.plotA, round: 3, date: '2025-03-15', aliveCount: 4108, avgHeightCm: 96 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-b1', plotId: SEED_IDS.plotB, round: 1, date: '2024-07-05', aliveCount: 2772, avgHeightCm: 41 }, totalByPlot[SEED_IDS.plotB]),
-    surveyRow({ id: 'survey-b2', plotId: SEED_IDS.plotB, round: 2, date: '2024-10-12', aliveCount: 2112, avgHeightCm: 55 }, totalByPlot[SEED_IDS.plotB]),
+    surveyRow({ id: 'survey-b2', plotId: SEED_IDS.plotB, round: 2, date: '2024-10-12', aliveCount: 2912, avgHeightCm: 55 }, totalByPlot[SEED_IDS.plotB]),
     surveyRow({ id: 'survey-c1', plotId: SEED_IDS.plotC, round: 1, date: '2024-05-28', aliveCount: 7680, avgHeightCm: 70 }, totalByPlot[SEED_IDS.plotC]),
     surveyRow({ id: 'survey-c2', plotId: SEED_IDS.plotC, round: 2, date: '2024-08-30', aliveCount: 7440, avgHeightCm: 88 }, totalByPlot[SEED_IDS.plotC]),
   ];
 
-  // ---------------- 补植计划（每地块 1 条，覆盖三种状态） ----------------
+  // ---------------- 补植计划（每地块 1 条，覆盖待补植 / 部分补植 / 已复核三种状态） ----------------
   const replants: Replant[] = [
-    replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }),
-    replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '已补植' }),
-    replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
+    replantRow({
+      id: 'replant-a1',
+      plotId: SEED_IDS.plotA,
+      missingCount: 1092,
+      actualCount: null,
+      baseAliveCount: null,
+      planDate: '2025-04-10',
+      species: '秋茄',
+      state: '待补植',
+    }),
+    replantRow({
+      id: 'replant-b1',
+      plotId: SEED_IDS.plotB,
+      missingCount: 1188,
+      actualCount: 800,
+      baseAliveCount: 2112,
+      planDate: '2025-04-18',
+      species: '白骨壤',
+      state: '部分补植',
+    }),
+    replantRow({
+      id: 'replant-c1',
+      plotId: SEED_IDS.plotC,
+      missingCount: 560,
+      actualCount: 560,
+      baseAliveCount: 7440,
+      planDate: '2024-11-05',
+      species: '无瓣海桑',
+      state: '已复核',
+    }),
   ];
 
   await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {

@@ -149,6 +149,8 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       id: uuid('replant'),
       plotId,
       missingCount: missing,
+      actualCount: null,
+      baseAliveCount: null,
       planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
       species,
       state: '待补植',

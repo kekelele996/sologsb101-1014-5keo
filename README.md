@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 5 | 开发端口与宿主端口一致（22814） |
 | 路由 | React Router 6 | `createBrowserRouter` + 路由懒加载 |
 | 状态管理 | Zustand 4 | 跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v3 升级迁移 |
 | 时间处理 | dayjs | |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
@@ -88,7 +88,7 @@ sologsb101-1014/
 | `/plots/:id/seedlings` | `pages/SeedlingBoard.tsx` | 苗木批次与来源登记、批次数量累计校验（含密度提示） |
 | `/plots/:id/plantings` | `pages/PlantingEntry.tsx` | 栽植记录：录株距与株数、按面积与株距校验密度合理性 |
 | `/surveys` | `pages/SurveyBoard.tsx` | 成活率与株高验收台：按测次录入、自动算成活率、低于阈值告警、批量调整成活率等级 |
-| `/replants` | `pages/ReplantPlan.tsx` | 补植计划：状态流转（待补植→已补植→已复核）、行内草稿、JSON 导入导出、结构版本查看 |
+| `/replants` | `pages/ReplantPlan.tsx` | 补植计划：状态流转（待补植→部分补植→已补植→已复核）、班组登记实际补植株数、行内草稿、JSON 导入导出、结构版本查看 |
 
 `/` 重定向到 `/plots`，未匹配路径统一回落到 `/plots`。
 **层级路由支持直接深链**：把 `http://localhost:22814/plots/plot-donggang-3/seedlings` 直接粘贴到地址栏即可打开；
@@ -100,11 +100,14 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，
+  `version(3)` 为补植计划补齐实际补植株数字段并启用「部分补植」状态：
   * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
   * 回填 `revision` / `createdAt` / `updatedAt`；
   * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）；
+  * 为 `replants` 补齐 `actualCount`（实际补植株数，待补植为 null，历史已完成记录按计划数回填）、
+    `baseAliveCount`（首次回写时最新测次的原成活株数快照），旧状态值保持不变。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -120,7 +123,7 @@ sologsb101-1014/
   * 3 个地块（东港南堤 3 号地块 / 西湾滩涂 A 区 / 北屿外滩 B 区），覆盖三种潮位带与三种底质；
   * 6 个苗木批次（每地块 2 批）、6 条栽植记录（每地块 2 条，引用真实批次 id）；
   * 7 条验收记录（每地块 2–3 个测次，成活率自洽：90.0% → 85.0% → 79.0% 等）；
-  * 3 条补植计划（覆盖待补植 / 已补植 / 已复核三种状态）。
+  * 3 条补植计划（覆盖待补植 / 部分补植（少补 388 株）/ 已复核三种状态，部分补植的实际数与最新测次成活率互为回写结果）。
   * 固定 id 如 `plot-donggang-3`、`plot-xiwan-a`、`plot-beiyu-b` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的地块 id」这一界面偏好，不存业务数据。
 * 删除地块会**级联清理**其下的苗木批次、栽植记录、验收记录与补植计划（同一 Dexie 事务内完成）。
@@ -150,5 +153,10 @@ npm run preview      # 预览 dist 产物
 * **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
-* **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
-  并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。
+* **补植回写（按实际数）**：班组把计划从「待补植」推进时必须登记**实际补植株数**（弹窗默认填计划数，可按现场少补/多补修改）：
+  * **少补**（累计实际数 < 计划数）：计划标记为「部分补植」并**留在待办**，可继续「推进状态」登记追加株数，直到补齐；
+  * **地块缺株数** = 计划数 − 累计实际数，**减到零为止**（多补不会写成负数）；同时写入最近补植日期；
+  * **最新测次成活率**按「原成活株数 + 累计实际补植株数」重算，成活株数**不超过该地块栽植总株数**（多补按总株数封顶，成活率上限 100%）；
+  * 原成活株数以首次回写时的快照（`baseAliveCount`）为准，部分补植分多次推进不会重复叠加；
+  * 补植计划页与地块台账同时展示**计划数、实际数、差额**；导出的成活率汇总 CSV 含
+    「计划补植株数 / 实际补植株数 / 补植差额（计划−实际）」三列，通报文本也带上实际补植株数。

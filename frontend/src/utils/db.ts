@@ -11,7 +11,7 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
-import { rateLevel } from './rate';
+import { calcSurvivalRate, rateLevel } from './rate';
 import { nowIso, today } from './id';
 import { seedDatabase } from './seed';
 
@@ -19,10 +19,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class MangroveDatabase extends Dexie {
   plots!: Table<Plot, string>;
@@ -79,6 +79,26 @@ class MangroveDatabase extends Dexie {
           const rate = typeof row.survivalRate === 'number' ? row.survivalRate : 0;
           if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
+        });
+      });
+
+    // ---------- v3：补植计划登记「实际补植株数」，新增「部分补植」状态 ----------
+    // 索引结构与 v2 一致，仅补齐行字段（Dexie 非索引字段无需在 stores() 中声明）。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade',
+        replants: 'id, plotId, planDate, state, species',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('replants').toCollection().modify((row: Record<string, unknown>) => {
+          // 历史数据：待补植尚无实际数；其余状态按「默认填计划数」回填
+          if (typeof row.actualCount !== 'number') {
+            row.actualCount = row.state === '待补植' ? null : typeof row.missingCount === 'number' ? row.missingCount : 0;
+          }
+          if (typeof row.baseAliveCount !== 'number') row.baseAliveCount = null;
         });
       });
   }
@@ -234,17 +254,38 @@ export async function removeReplant(id: string): Promise<void> {
 }
 
 /**
- * 补植完成回写：
- * 1）扣减地块缺株数；2）写入最近补植日期；3）按补植后的总株数重算最新一次验收的成活率。
+ * 补植完成回写（登记实际补植株数时触发）：
+ * 1）缺株数按「计划数 − 实际数」回写，减到零为止（多补也不会写成负数）；
+ * 2）写入最近补植日期；
+ * 3）最新测次按「原成活株数 + 累计实际补植株数」重算成活率，成活株数以栽植总株数封顶。
+ *
+ * 实际数少于计划数时落到「部分补植」：只回写差额，且该计划留在待办，
+ * 可再次推进（第二次的 actualCount 为追加补植株数）。
  */
-export async function applyReplantCompletion(replantId: string): Promise<void> {
+export async function applyReplantCompletion(
+  replantId: string,
+  next: ReplantState,
+  actualCount: number,
+): Promise<void> {
   await db.transaction('rw', db.plots, db.replants, db.surveys, db.plantings, async () => {
     const replant = await db.replants.get(replantId);
     if (!replant) return;
     const plot = await db.plots.get(replant.plotId);
     if (!plot) return;
 
-    const nextMissing = Math.max(0, plot.missingCount - replant.missingCount);
+    // 部分补植 → 补齐时，入参为本次追加株数，累计到已登记的实际数上
+    const previouslyApplied = replant.actualCount ?? 0;
+    const accumulated = Math.max(0, previouslyApplied + Math.max(0, actualCount));
+    // 缺株数：首次推进即「计划数 − 实际数」，减到零为止；
+    // 部分补植二次推进 / 多条计划并存时，按本次新增实际数增量扣减，避免冲掉其它缺口
+    const nextMissing = Math.max(0, plot.missingCount - (accumulated - previouslyApplied));
+
+    await db.replants.update(replant.id, {
+      state: next,
+      actualCount: accumulated,
+      updatedAt: nowIso(),
+    });
+
     await db.plots.update(plot.id, {
       missingCount: nextMissing,
       lastReplantDate: today(),
@@ -256,24 +297,36 @@ export async function applyReplantCompletion(replantId: string): Promise<void> {
     const surveys = await db.surveys.where('plotId').equals(plot.id).toArray();
     if (surveys.length === 0) return;
     const latest = surveys.reduce((acc, item) => (item.round > acc.round ? item : acc));
-    // 补植后按「原成活株数 + 本次补植株数」重新计算成活率
-    const aliveAfter = latest.aliveCount + replant.missingCount;
-    const rate = total > 0 ? Math.round(Math.min(100, (aliveAfter / total) * 100) * 10) / 10 : latest.survivalRate;
-    await db.surveys.update(latest.id, {
-      aliveCount: aliveAfter,
-      survivalRate: rate,
-      grade: latest.gradeManual ? latest.grade : rateLevel(rate),
-      updatedAt: nowIso(),
-    });
+    // 以首次回写时的原成活株数为基准（快照），后续追加补植只加一次，避免重复叠加
+    const baseAlive = replant.baseAliveCount ?? latest.aliveCount;
+    const aliveAfter = total > 0 ? Math.min(total, baseAlive + accumulated) : baseAlive + accumulated;
+    const rate = total > 0 ? calcSurvivalRate(aliveAfter, total) : latest.survivalRate;
+    await Promise.all([
+      db.replants.update(replant.id, { baseAliveCount: baseAlive }),
+      db.surveys.update(latest.id, {
+        aliveCount: aliveAfter,
+        survivalRate: rate,
+        grade: latest.gradeManual ? latest.grade : rateLevel(rate),
+        updatedAt: nowIso(),
+      }),
+    ]);
   });
 }
 
-/** 推进补植状态（待补植 → 已补植 → 已复核），推进到「已补植」时触发回写 */
-export async function advanceReplantState(replantId: string, next: ReplantState): Promise<void> {
-  await db.replants.update(replantId, { state: next, updatedAt: nowIso() });
-  if (next === '已补植') {
-    await applyReplantCompletion(replantId);
+/**
+ * 推进补植状态（待补植 → 部分补植 → 已补植 → 已复核）：
+ * 进入「部分补植 / 已补植」时必须带上本次登记的实际补植株数并触发回写。
+ */
+export async function advanceReplantState(
+  replantId: string,
+  next: ReplantState,
+  actualCount?: number,
+): Promise<void> {
+  if (next === '部分补植' || next === '已补植') {
+    await applyReplantCompletion(replantId, next, Math.max(0, Math.floor(actualCount ?? 0)));
+    return;
   }
+  await db.replants.update(replantId, { state: next, updatedAt: nowIso() });
 }
 
 /* ---------------------------- 整库快照 ---------------------------- */
@@ -310,7 +363,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）；兼容缺少 v3 字段的旧版存档 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
     await Promise.all([
@@ -324,7 +377,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
+    // 旧版存档无实际补植株数：按「默认填计划数」回填（待补植仍为 null）
+    await db.replants.bulkPut(
+      snapshot.replants.map((row) => ({
+        ...row,
+        actualCount:
+          typeof row.actualCount === 'number' ? row.actualCount : row.state === '待补植' ? null : row.missingCount,
+        baseAliveCount: typeof row.baseAliveCount === 'number' ? row.baseAliveCount : null,
+        revision: ROW_REVISION,
+      })),
+    );
   });
 }
 

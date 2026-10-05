@@ -1,6 +1,7 @@
 /**
  * /replants 补植计划与结构版本
- * 补植计划增删改、状态流转（待补植 → 已补植 → 已复核）、草稿行内编辑、JSON 导入导出。
+ * 补植计划增删改、状态流转（待补植 → 部分补植 → 已补植 → 已复核）、实际补植株数登记、
+ * 草稿行内编辑、JSON 导入导出。推进时由班组登记实际数（默认计划数），少补自动标「部分补植」并留在待办。
  * 消费模型：Replant、Survey、全部模型；复用组件：<StatBadge>、<EmptyPanel>、<FilterBar>
  */
 import { useMemo, useState } from 'react';
@@ -18,6 +19,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
 } from 'antd';
@@ -40,7 +42,15 @@ import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useReplantStore } from '../stores/replantStore';
 import { DB_NAME, DB_SCHEMA_VERSION, db } from '../utils/db';
-import { REPLANT_STATE_OPTIONS, type Replant, type ReplantDraft, type ReplantState } from '../types/replant';
+import {
+  isReplantPending,
+  replantGap,
+  replantStateColor,
+  REPLANT_STATE_OPTIONS,
+  type Replant,
+  type ReplantDraft,
+  type ReplantState,
+} from '../types/replant';
 import { SEEDLING_SPECIES_OPTIONS, type SeedlingSpecies } from '../types/seedling';
 import { exportSnapshotJson, exportSummaryCsvFile, parseSnapshot } from '../utils/export';
 import { percentText } from '../utils/rate';
@@ -48,9 +58,17 @@ import { percentText } from '../utils/rate';
 interface ReplantFormValues {
   plotId: string;
   missingCount: number;
+  actualCount: number | null;
   planDate: Dayjs;
   species: SeedlingSpecies;
   state: ReplantState;
+}
+
+/** 推进状态时的实际补植株数登记弹窗 */
+interface ActualModalState {
+  row: Replant;
+  /** 本次需要登记的株数（部分补植再次推进时为追加株数） */
+  value: number;
 }
 
 export default function ReplantPlan() {
@@ -85,7 +103,11 @@ export default function ReplantPlan() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Replant | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [actualModal, setActualModal] = useState<ActualModalState | null>(null);
+  const [actualSaving, setActualSaving] = useState(false);
+  const [actualForm] = Form.useForm<{ actualCount: number }>();
   const [form] = Form.useForm<ReplantFormValues>();
+  const formState = Form.useWatch('state', form) as ReplantState | undefined;
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
 
@@ -104,10 +126,16 @@ export default function ReplantPlan() {
 
   const stats = useMemo(() => {
     const missing = rows.reduce((acc, row) => acc + row.missingCount, 0);
+    const actual = rows.reduce((acc, row) => acc + (row.actualCount ?? 0), 0);
+    const shortfall = rows
+      .filter((row) => isReplantPending(row.state))
+      .reduce((acc, row) => acc + Math.max(0, replantGap(row) ?? row.missingCount), 0);
     const reviewed = rows.filter((row) => row.state === '已复核').length;
-    const pending = rows.filter((row) => row.state === '待补植').length;
+    const pending = rows.filter((row) => isReplantPending(row.state)).length;
     return {
       missing,
+      actual,
+      shortfall,
       pending,
       reviewed,
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
@@ -121,6 +149,7 @@ export default function ReplantPlan() {
     form.setFieldsValue({
       plotId,
       missingCount: stat.suggestReplant > 0 ? stat.suggestReplant : 100,
+      actualCount: null,
       planDate: dayjs().add(15, 'day'),
       species: seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄',
       state: '待补植',
@@ -133,6 +162,7 @@ export default function ReplantPlan() {
     form.setFieldsValue({
       plotId: row.plotId,
       missingCount: row.missingCount,
+      actualCount: row.actualCount,
       planDate: dayjs(row.planDate),
       species: row.species,
       state: row.state,
@@ -147,6 +177,7 @@ export default function ReplantPlan() {
       const payload: ReplantDraft = {
         plotId: values.plotId,
         missingCount: values.missingCount,
+        actualCount: values.state === '待补植' ? null : values.actualCount ?? values.missingCount,
         planDate: values.planDate.format('YYYY-MM-DD'),
         species: values.species,
         state: values.state,
@@ -166,13 +197,53 @@ export default function ReplantPlan() {
     }
   };
 
-  const handleAdvance = async (row: Replant): Promise<void> => {
-    const next = await advance(row.id);
-    if (next === null) {
+  const handleAdvance = (row: Replant): void => {
+    if (row.state === '已复核') {
       message.info('该计划已处于最终状态（已复核）');
       return;
     }
-    message.success(`状态已推进为「${next}」`);
+    // 已补植 → 已复核无需再登记实际数
+    if (row.state === '已补植') {
+      void (async () => {
+        const next = await advance(row.id);
+        if (next !== null) message.success(`状态已推进为「${next}」`);
+      })();
+      return;
+    }
+    // 待补植默认计划数；部分补植再推进时默认补齐剩余计划数
+    const done = row.actualCount ?? 0;
+    const remaining = Math.max(0, row.missingCount - done);
+    const defaultValue = remaining > 0 ? remaining : row.missingCount;
+    actualForm.resetFields();
+    actualForm.setFieldsValue({ actualCount: defaultValue });
+    setActualModal({ row, value: defaultValue });
+  };
+
+  const handleConfirmActual = async (): Promise<void> => {
+    if (actualModal === null) return;
+    try {
+      const values = await actualForm.validateFields();
+      setActualSaving(true);
+      const next = await advance(actualModal.row.id, values.actualCount);
+      if (next === null) {
+        message.info('该计划已处于最终状态（已复核）');
+      } else if (next === '部分补植') {
+        message.success(`实际补植 ${values.actualCount} 株，少于计划数，已标记为部分补植并留在待办`);
+      } else if (next === '已补植') {
+        message.success(
+          actualModal.row.state === '部分补植'
+            ? `本次补植 ${values.actualCount} 株，已补齐剩余缺株，缺株数与成活率已回写`
+            : `已按实际补植 ${values.actualCount} 株回写缺株数并重算成活率`,
+        );
+      } else {
+        message.success(`状态已推进为「${next}」`);
+      }
+      setActualModal(null);
+    } catch (error) {
+      if (error instanceof Error && error.message !== 'validation') message.error(error.message);
+    } finally {
+      setActualSaving(false);
+    }
   };
 
   const handleExport = async (): Promise<void> => {
@@ -230,9 +301,10 @@ export default function ReplantPlan() {
       ),
     },
     {
-      title: '缺株数（株）',
+      title: '计划数（株）',
       key: 'missingCount',
-      width: 190,
+      width: 150,
+      align: 'right',
       render: (_value, record) => {
         const draft = drafts[record.id];
         if (draft === undefined) return record.missingCount.toLocaleString('zh-CN');
@@ -242,10 +314,40 @@ export default function ReplantPlan() {
             max={200000}
             step={10}
             size="small"
-            style={{ width: 130 }}
+            style={{ width: 120 }}
             value={draft.missingCount ?? record.missingCount}
             onChange={(value) => setDraft(record.id, { missingCount: value ?? 0 })}
           />
+        );
+      },
+    },
+    {
+      title: '实际补植（株）',
+      key: 'actualCount',
+      width: 140,
+      align: 'right',
+      render: (_value, record) =>
+        record.actualCount === null ? (
+          <Typography.Text type="secondary">—</Typography.Text>
+        ) : (
+          record.actualCount.toLocaleString('zh-CN')
+        ),
+    },
+    {
+      title: '差额（计划−实际）',
+      key: 'gap',
+      width: 150,
+      align: 'right',
+      render: (_value, record) => {
+        const gap = replantGap(record);
+        if (gap === null) return <Typography.Text type="secondary">—</Typography.Text>;
+        if (gap === 0) return <Tag color="green">已补齐</Tag>;
+        return (
+          <Tooltip title={gap > 0 ? '实际少补，仍缺对应株数，计划留在待办' : '实际多补，已按栽植总株数封顶，缺株数记 0'}>
+            <Tag color={gap > 0 ? 'volcano' : 'gold'} style={{ marginInlineEnd: 0 }}>
+              {gap > 0 ? '少补' : '多补'} {Math.abs(gap).toLocaleString('zh-CN')}
+            </Tag>
+          </Tooltip>
         );
       },
     },
@@ -289,9 +391,13 @@ export default function ReplantPlan() {
       title: '状态',
       dataIndex: 'state',
       key: 'state',
-      width: 110,
+      width: 120,
       render: (value: ReplantState) => (
-        <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+        <Tooltip title={value === '部分补植' ? '实际少补，计划留在待办，可继续推进补齐剩余缺株' : undefined}>
+          <Tag color={replantStateColor(value)} style={{ marginInlineEnd: 0 }}>
+            {value}
+          </Tag>
+        </Tooltip>
       ),
     },
     {
@@ -323,8 +429,7 @@ export default function ReplantPlan() {
                 species: record.species,
                 state: record.state,
               })
-            }
-          >
+            }          >
             改草稿
           </Button>
         ),
@@ -341,9 +446,9 @@ export default function ReplantPlan() {
             type="link"
             icon={<SyncOutlined />}
             disabled={record.state === '已复核'}
-            onClick={() => void handleAdvance(record)}
+            onClick={() => handleAdvance(record)}
           >
-            推进状态
+            {record.state === '部分补植' ? '继续补植' : '推进状态'}
           </Button>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
@@ -371,8 +476,23 @@ export default function ReplantPlan() {
     <div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="补植计划" value={rows.length} suffix="条" tone="primary" />
-        <StatBadge label="待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
-        <StatBadge label="缺株合计" value={stats.missing.toLocaleString('zh-CN')} suffix="株" tone="danger" />
+        <StatBadge
+          label="待办补植"
+          value={stats.pending}
+          suffix="条"
+          tone={stats.pending > 0 ? 'warning' : 'default'}
+          hint="状态为「待补植」或「部分补植」的计划，少补的计划会留在待办继续跟进"
+        />
+        <StatBadge label="计划补植合计" value={stats.missing.toLocaleString('zh-CN')} suffix="株" tone="danger" />
+        <StatBadge label="实际补植合计" value={stats.actual.toLocaleString('zh-CN')} suffix="株" tone="info" />
+        <StatBadge
+          label="待补缺口"
+          value={stats.shortfall.toLocaleString('zh-CN')}
+          suffix="株"
+          tone={stats.shortfall > 0 ? 'warning' : 'default'}
+          size="small"
+          hint="待办计划中计划数减实际数的尚缺株数合计"
+        />
         <StatBadge
           label="复核完成率"
           value={percentText(stats.reviewPct)}
@@ -456,7 +576,7 @@ export default function ReplantPlan() {
         {rows.length === 0 && !loading ? (
           <EmptyPanel
             title="还没有补植计划"
-            description="验收成活率偏低时可一键生成补植计划；也可以在这里手动新建，并按「待补植 → 已补植 → 已复核」推进。"
+            description="验收成活率偏低时可一键生成补植计划；也可以在这里手动新建，并按「待补植 → 部分补植 → 已补植 → 已复核」推进，推进时登记班组实际补植株数（默认计划数），少补会标成部分补植并留在待办。"
             actionText="新建补植计划"
             onAction={openCreate}
           />
@@ -467,7 +587,7 @@ export default function ReplantPlan() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1400 }}
+            scroll={{ x: 1620 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -496,12 +616,23 @@ export default function ReplantPlan() {
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item
               name="missingCount"
-              label="缺株数（株）"
+              label="计划补植（株）"
               style={{ flex: 1 }}
-              rules={[{ required: true, message: '请填写缺株数' }]}
+              rules={[{ required: true, message: '请填写计划补植株数' }]}
             >
               <InputNumber min={1} max={200000} step={10} style={{ width: '100%' }} />
             </Form.Item>
+            {formState !== undefined && formState !== '待补植' ? (
+              <Form.Item
+                name="actualCount"
+                label="实际补植（株）"
+                style={{ flex: 1 }}
+                rules={[{ required: true, message: '请填写实际补植株数' }]}
+                extra="留档补录用，不在此处触发回写"
+              >
+                <InputNumber min={0} max={200000} step={10} style={{ width: '100%' }} placeholder="默认同计划数" />
+              </Form.Item>
+            ) : null}
             <Form.Item name="planDate" label="计划日期" style={{ flex: 1 }} rules={[{ required: true }]}>
               <DatePicker style={{ width: '100%' }} />
             </Form.Item>
@@ -515,9 +646,52 @@ export default function ReplantPlan() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率。
+            班组在列表中「推进状态」时登记实际补植株数（默认填计划数）：实际少于计划数会标成「部分补植」并留在待办；
+            地块缺株数按计划数减实际数回写（减到零为止），并按原成活株数加实际补植株数重算最新测次成活率。
           </Typography.Text>
         </Form>
+      </Modal>
+
+      <Modal
+        title="登记实际补植株数"
+        open={actualModal !== null}
+        onCancel={() => setActualModal(null)}
+        onOk={() => void handleConfirmActual()}
+        confirmLoading={actualSaving}
+        okText="确认推进"
+        cancelText="取消"
+        destroyOnClose
+      >
+        {actualModal !== null ? (
+          <Form form={actualForm} layout="vertical">
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
+              {plotName(actualModal.row.plotId)} · {actualModal.row.species} · 计划补植{' '}
+              {actualModal.row.missingCount.toLocaleString('zh-CN')} 株
+              {actualModal.row.state === '部分补植' && actualModal.row.actualCount !== null ? (
+                <>
+                  ，已补 {actualModal.row.actualCount.toLocaleString('zh-CN')} 株，尚缺{' '}
+                  {Math.max(0, actualModal.row.missingCount - actualModal.row.actualCount).toLocaleString('zh-CN')} 株
+                </>
+              ) : null}
+            </Typography.Paragraph>
+            <Form.Item
+              name="actualCount"
+              label={actualModal.row.state === '部分补植' ? '本次追加补植株数（株）' : '本次实际补植株数（株）'}
+              rules={[
+                { required: true, message: '请填写实际补植株数' },
+                {
+                  validator: (_rule, value: number | null | undefined) =>
+                    typeof value === 'number' && value > 0
+                      ? Promise.resolve()
+                      : Promise.reject(new Error('实际补植株数需大于 0；一株未补时请保持待办')),
+                },
+              ]}
+              extra="默认填计划数，可按现场实际少补或多补修改。少于计划数将标记为「部分补植」并留在待办。"
+            >
+              <InputNumber min={1} max={200000} step={10} style={{ width: '100%' }} autoFocus />
+            </Form.Item>
+          </Form>
+        ) : null}
       </Modal>
     </div>
   );
